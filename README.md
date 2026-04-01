@@ -1,11 +1,11 @@
-# yolov12-quant
+# yolov12-change
 
 YOLOv12 with PolarQuant feature compression for memory-efficient training.
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/CloudWhiteTower/yolov12-quant.git
+pip install git+https://github.com/CloudWhiteTower/yolov12-change.git
 ```
 
 ## Features
