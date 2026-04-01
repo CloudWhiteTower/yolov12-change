@@ -129,19 +129,19 @@ class AAttnQuant(nn.Module):
 
     def _quantize_qk(self, q, k):
         B, N, C = q.shape
-        q_reshaped = q.view(B * N, self.num_heads, self.head_dim)
-        k_reshaped = k.view(B * N, self.num_heads, self.head_dim)
+        q_reshaped = q.reshape(B * N, self.num_heads, self.head_dim)
+        k_reshaped = k.reshape(B * N, self.num_heads, self.head_dim)
 
         q_quant = self.pq_qk.quantize_dequantize(q_reshaped.reshape(-1, self.head_dim))
         k_quant = self.pq_qk.quantize_dequantize(k_reshaped.reshape(-1, self.head_dim))
 
-        return q_quant.view(B, N, C), k_quant.view(B, N, C)
+        return q_quant.reshape(B, N, C), k_quant.reshape(B, N, C)
 
     def _quantize_v(self, v):
         B, N, C = v.shape
-        v_reshaped = v.view(B * N, self.num_heads, self.head_dim)
+        v_reshaped = v.reshape(B * N, self.num_heads, self.head_dim)
         v_quant = self.pq_v.quantize_dequantize(v_reshaped.reshape(-1, self.head_dim))
-        return v_quant.view(B, N, C)
+        return v_quant.reshape(B, N, C)
 
 
 class ABlockQuant(nn.Module):
