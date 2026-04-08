@@ -68,6 +68,7 @@ from ultralytics.nn.modules import (
     A2C2fQuant,  # 自定义量化模块
     EMA,  # 大豆豆荚分割改进模块
     CoordAttention,
+    A2C2fEMA,
 )
 
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
@@ -1004,6 +1005,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             A2C2fQuant,
             EMA,
             CoordAttention,
+            A2C2fEMA,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1032,6 +1034,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2PSA,
                 A2C2f,
                 A2C2fQuant,
+                A2C2fEMA,
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1
@@ -1039,7 +1042,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
-            if m is A2C2f: 
+            if m in {A2C2f, A2C2fEMA}: 
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.append(True)
