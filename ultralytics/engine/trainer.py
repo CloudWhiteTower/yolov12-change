@@ -571,6 +571,10 @@ class BaseTrainer:
     def setup_model(self):
         """Load/create/download model for any task."""
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
+            if isinstance(self.args.pretrained, (str, Path)):
+                weights, _ = attempt_load_one_weight(self.args.pretrained)
+                self.model.load(weights)
+                LOGGER.info(f"Loaded pretrained weights from {self.args.pretrained}")
             return
 
         cfg, weights = self.model, None
