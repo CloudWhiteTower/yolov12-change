@@ -1,7 +1,9 @@
-"""大豆豆荚分割改进模块：EMA 和 CoordAttention。"""
+"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA。"""
 
 import torch
 import torch.nn as nn
+
+from ultralytics.nn.modules.block import A2C2f
 
 
 class EMA(nn.Module):
@@ -91,7 +93,7 @@ class CoordAttention(nn.Module):
         return identity * a_h * a_w
 
 
-class A2C2fEMA(nn.Module):
+class A2C2fEMA(A2C2f):
     """A2C2f + EMA 融合模块：在 R-ELAN 输出后施加多尺度注意力。
 
     通过类继承保持层索引不变，实现预训练权重 ~98% 加载率。
@@ -104,10 +106,56 @@ class A2C2fEMA(nn.Module):
     def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
                  residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
                  g: int = 1, shortcut: bool = True):
-        super().__init__()
-        from ultralytics.nn.modules.block import A2C2f
-        self._a2c2f = A2C2f(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
         self.post_ema = EMA(c2, c2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.post_ema(self._a2c2f(x))
+        out = super().forward(x)
+        return self.post_ema(out)
+
+
+class SimAM(nn.Module):
+    """SimAM: Simple, Parameter-Free Attention Module (ICML 2021).
+
+    基于计算神经科学的能量最小化原则，零可训练参数。
+    对每个神经元计算其与同通道其他神经元的线性可分性:
+        e_t = (x_t - μ)² / (4(σ² + λ))
+        weight = sigmoid(1 / e_t)
+
+    Args:
+        lam: 正则化系数，默认 1e-4
+    """
+
+    def __init__(self, lam: float = 1e-4):
+        super().__init__()
+        self.lam = lam
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        mu = x.mean(dim=[2, 3], keepdim=True)
+        var = ((x - mu) ** 2).mean(dim=[2, 3], keepdim=True)
+        # 能量函数: e_t = (x_t - μ)² / (4(σ² + λ))
+        e_t = (x - mu) ** 2 / (4 * (var + self.lam)) + 0.5
+        # 权重: sigmoid(1/e_t) — 偏离均值越大 → 能量越高 → 权重越大
+        return x * torch.sigmoid(1.0 / e_t)
+
+
+class A2C2fSimAM(A2C2f):
+    """A2C2f + SimAM 融合模块：在 R-ELAN 输出后施加零参数 3D 注意力。
+
+    通过类继承保持层索引不变，预训练权重 100% 加载率。
+    SimAM 无可训练参数，不存在过拟合风险。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_simam = SimAM()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        return self.post_simam(out)

@@ -93,6 +93,8 @@ class BboxLoss(nn.Module):
 
     # 模块级开关：设为 True 使用 Shape-IoU 替代 CIoU（适合细长目标）
     use_shape_iou = False
+    # 模块级开关：设为 True 使用 Wise-IoU v3 替代 CIoU（动态非单调聚焦）
+    use_wise_iou = False
 
     def __init__(self, reg_max=16):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
@@ -104,6 +106,8 @@ class BboxLoss(nn.Module):
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         if BboxLoss.use_shape_iou:
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, ShapeIoU=True)
+        elif BboxLoss.use_wise_iou:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, WiseIoU=True)
         else:
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum

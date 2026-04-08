@@ -25,7 +25,7 @@ from .transformer import (
 from .polar_quant import PolarQuantTorch
 from .quant_attn import AAttnQuant, ABlockQuant, A2C2fQuant
 # 大豆豆荚分割改进模块
-from .pod_modules import EMA, CoordAttention, A2C2fEMA
+from .pod_modules import EMA, CoordAttention, A2C2fEMA, SimAM, A2C2fSimAM
 
 __all__ = (
     "Conv", "Conv2", "LightConv", "RepConv", "DWConv", "DWConvTranspose2d",
@@ -43,5 +43,5 @@ __all__ = (
     # 自定义量化模块
     "PolarQuantTorch", "AAttnQuant", "ABlockQuant", "A2C2fQuant",
     # 大豆豆荚分割改进模块
-    "EMA", "CoordAttention", "A2C2fEMA",
+    "EMA", "CoordAttention", "A2C2fEMA", "SimAM", "A2C2fSimAM",
 )
