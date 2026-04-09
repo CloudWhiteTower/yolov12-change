@@ -1,9 +1,10 @@
-"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA。"""
+"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial。"""
 
 import torch
 import torch.nn as nn
 
 from ultralytics.nn.modules.block import A2C2f
+from ultralytics.nn.modules.conv import SpatialAttention
 
 
 class EMA(nn.Module):
@@ -159,3 +160,38 @@ class A2C2fSimAM(A2C2f):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = super().forward(x)
         return self.post_simam(out)
+
+
+class A2C2fEMASpatial(A2C2f):
+    """A2C2f + EMA + SpatialAttention 融合模块（R5 实验）。
+
+    在 R-ELAN 输出后依次施加:
+      1. EMA（通道维度多尺度注意力）
+      2. SpatialAttention（空间维度注意力，CBAM 空间分支）
+
+    设计依据：
+      - EMA 在 R1 中证明有效（+0.73% mAP50），负责通道维度加权
+      - SpatialAttention 负责空间维度加权，与 EMA 维度正交
+      - 二者级联形成"通道→空间"递进注意力
+      - 参数增量极低：EMA ~16K + SpatialAttention ~50 参数
+
+    论文来源：
+      - EMA: ICASSP 2023 / FEI-YOLO (Agronomy 2024)
+      - SpatialAttention: CBAM (ECCV 2018)
+
+    Args:
+        继承 A2C2f 全部参数。
+        kernel_size: SpatialAttention 卷积核大小，默认 7。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_ema = EMA(c2, c2)
+        self.post_spatial = SpatialAttention(kernel_size=7)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        out = self.post_ema(out)
+        return self.post_spatial(out)
