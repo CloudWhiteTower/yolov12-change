@@ -1,4 +1,6 @@
-"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial。"""
+"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial、ECALayer、GRN、A2C2fECA、A2C2fEMAECA、A2C2fEMAGRN。"""
+
+import math
 
 import torch
 import torch.nn as nn
@@ -195,3 +197,124 @@ class A2C2fEMASpatial(A2C2f):
         out = super().forward(x)
         out = self.post_ema(out)
         return self.post_spatial(out)
+
+
+class ECALayer(nn.Module):
+    """ECA-Net: Efficient Channel Attention (CVPR 2020).
+
+    通过 1D 自适应卷积捕获局部通道交互，避免 FC 层的降维信息损失。
+    纯通道注意力，与 EMA 的空间门控完全正交。
+
+    论文: Wang Q, Wu B, Zhu P, et al.
+          "ECA-Net: Efficient Channel Attention for Deep CNNs", CVPR 2020.
+
+    Args:
+        channels: 输入通道数
+        gamma: 核大小自适应参数，默认 2
+        b: 核大小自适应偏移，默认 1
+    """
+
+    def __init__(self, channels: int, gamma: int = 2, b: int = 1):
+        super().__init__()
+        t = int(abs(math.log2(channels) + b) / gamma)
+        k = t if t % 2 else t + 1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.avg_pool(x)
+        y = y.squeeze(-1).transpose(-1, -2)
+        y = self.conv(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return x * self.sigmoid(y)
+
+
+class GRN(nn.Module):
+    """Global Response Normalization (ConvNeXt V2, CVPR 2023).
+
+    通过全局 L2 范数归一化促进通道多样性。零 sigmoid，零级联风险。
+    gamma/beta 初始化为 0 → 训练初期等价于恒等映射。
+
+    论文: Woo S, Debnath S, Hu R, et al.
+          "ConvNeXt V2: Co-designing and Scaling ConvNets with MAE", CVPR 2023.
+
+    Args:
+        channels: 输入通道数
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
+        return self.gamma * (x * nx) + self.beta + x
+
+
+class A2C2fECA(A2C2f):
+    """A2C2f + ECA 融合模块：在 R-ELAN 输出后施加纯通道注意力。
+
+    ECA 不含空间操作，与 A2C2f 内部的 Area Attention 正交。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_eca = ECALayer(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        return self.post_eca(out)
+
+
+class A2C2fEMAECA(A2C2f):
+    """A2C2f + EMA + ECA 融合模块：分组空间注意力 + 全局通道注意力。
+
+    EMA 负责空间维度门控（per-group），ECA 负责通道维度标定（global）。
+    ECA 的 sigmoid 作用于通道标量 (B,C,1,1)，不与 EMA 的空间 sigmoid 级联。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_ema = EMA(c2, c2)
+        self.post_eca = ECALayer(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        out = self.post_ema(out)
+        return self.post_eca(out)
+
+
+class A2C2fEMAGRN(A2C2f):
+    """A2C2f + EMA + GRN 融合模块：分组空间注意力 + 全局通道多样性正则化。
+
+    EMA 负责空间维度门控，GRN 负责促进通道多样性。
+    GRN 完全不含 sigmoid/tanh（纯线性+残差），零级联风险。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_ema = EMA(c2, c2)
+        self.post_grn = GRN(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        out = self.post_ema(out)
+        return self.post_grn(out)
