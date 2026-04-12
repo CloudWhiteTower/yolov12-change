@@ -1,4 +1,4 @@
-"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial、ECALayer、GRN、A2C2fECA、A2C2fEMAECA、A2C2fEMAGRN。"""
+"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial、ECALayer、GRN、A2C2fECA、A2C2fEMAECA、A2C2fEMAGRN、TripletAttention、MSCALite、A2C2fTriplet、A2C2fMSCA。"""
 
 import math
 
@@ -318,3 +318,165 @@ class A2C2fEMAGRN(A2C2f):
         out = super().forward(x)
         out = self.post_ema(out)
         return self.post_grn(out)
+
+
+# ── Triplet Attention (WACV 2021) ────────────────────────────────────────
+
+
+class _ZPool(nn.Module):
+    """Z-Pool: 沿通道维度拼接 max 和 avg，输出 2 通道。"""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x.max(dim=1, keepdim=True).values,
+                          x.mean(dim=1, keepdim=True)], dim=1)
+
+
+class _AttentionGate(nn.Module):
+    """单个注意力分支：Z-Pool → 7×7 Conv → BN → Sigmoid。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.compress = _ZPool()
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn = nn.BatchNorm2d(1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.sigmoid(self.bn(self.conv(self.compress(x))))
+
+
+class TripletAttention(nn.Module):
+    """Triplet Attention: 三分支跨维度注意力（WACV 2021）。
+
+    通过维度旋转(permute)让 7×7 卷积分别建模 (C×H)、(C×W)、(H×W) 交互，
+    三分支取均值融合。无通道数相关参数，总参数量恒定 ~300。
+
+    论文: Misra D, Nalamada T, Arasanipalai A U, Hou Q.
+          "Rotate to Attend: Convolutional Triplet Attention Module", WACV 2021.
+    代码: https://github.com/LandskapeAI/triplet-attention
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ch_h = _AttentionGate()  # C×H 分支
+        self.ch_w = _AttentionGate()  # C×W 分支
+        self.hw = _AttentionGate()    # H×W 分支（空间注意力）
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 分支 1: (B,C,H,W) → 旋转为 (B,H,C,W) → 注意力 → 转回
+        x_perm1 = x.permute(0, 2, 1, 3)
+        out1 = self.ch_h(x_perm1).permute(0, 2, 1, 3)
+
+        # 分支 2: (B,C,H,W) → 旋转为 (B,W,H,C) → 注意力 → 转回
+        x_perm2 = x.permute(0, 3, 2, 1)
+        out2 = self.ch_w(x_perm2).permute(0, 3, 2, 1)
+
+        # 分支 3: (B,C,H,W) 直接做空间注意力 (H×W)
+        out3 = self.hw(x)
+
+        return (out1 + out2 + out3) / 3.0
+
+
+class A2C2fTriplet(A2C2f):
+    """A2C2f + Triplet Attention 融合模块。
+
+    在 R-ELAN 输出后施加跨维度三分支注意力，
+    同时捕获通道-空间交互。参数增量恒定 ~300。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_triplet = TripletAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        return self.post_triplet(out)
+
+
+# ── MSCALite (SegNeXt NeurIPS 2022 简化版) ───────────────────────────────
+
+
+class MSCALite(nn.Module):
+    """轻量多尺度条形卷积注意力（SegNeXt 简化版）。
+
+    DW 5×5 局部上下文 → 三组并行非对称 DW strip conv 捕获方向性长距离依赖 →
+    相加 → 1×1 Conv 通道混合 → sigmoid 门控。
+
+    条形卷积天然匹配细长豆荚的长轴/短轴方向。
+    DW-only ~14K @128ch, ~56K @512ch。
+
+    论文: Guo M-H, Lu C-Z, Hou Q, et al.
+          "SegNeXt: Rethinking Convolutional Attention Design for Semantic Segmentation",
+          NeurIPS 2022.
+    代码: https://github.com/Visual-Attention-Network/SegNeXt
+
+    Args:
+        channels: 输入/输出通道数
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        # 局部上下文: DW 5×5
+        self.dw5x5 = nn.Conv2d(channels, channels, kernel_size=5, padding=2,
+                                groups=channels, bias=False)
+
+        # 三组并行非对称 strip DW conv（捕获 3 种尺度方向性依赖）
+        # Strip 1: 1×7 + 7×1 (小尺度)
+        self.strip1_h = nn.Conv2d(channels, channels, kernel_size=(1, 7), padding=(0, 3),
+                                   groups=channels, bias=False)
+        self.strip1_v = nn.Conv2d(channels, channels, kernel_size=(7, 1), padding=(3, 0),
+                                   groups=channels, bias=False)
+        # Strip 2: 1×11 + 11×1 (中尺度)
+        self.strip2_h = nn.Conv2d(channels, channels, kernel_size=(1, 11), padding=(0, 5),
+                                   groups=channels, bias=False)
+        self.strip2_v = nn.Conv2d(channels, channels, kernel_size=(11, 1), padding=(5, 0),
+                                   groups=channels, bias=False)
+        # Strip 3: 1×21 + 21×1 (大尺度)
+        self.strip3_h = nn.Conv2d(channels, channels, kernel_size=(1, 21), padding=(0, 10),
+                                   groups=channels, bias=False)
+        self.strip3_v = nn.Conv2d(channels, channels, kernel_size=(21, 1), padding=(10, 0),
+                                   groups=channels, bias=False)
+
+        # 通道混合: 1×1 Conv
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 局部上下文
+        attn = self.dw5x5(x)
+
+        # 三组 strip conv 并行 → 相加
+        s1 = self.strip1_v(self.strip1_h(attn))
+        s2 = self.strip2_v(self.strip2_h(attn))
+        s3 = self.strip3_v(self.strip3_h(attn))
+        attn = s1 + s2 + s3
+
+        # 通道混合 → sigmoid 门控
+        attn = self.sigmoid(self.proj(attn))
+        return x * attn
+
+
+class A2C2fMSCA(A2C2f):
+    """A2C2f + MSCALite 融合模块。
+
+    在 R-ELAN 输出后施加多尺度条形卷积注意力，
+    通过方向性非对称 DW conv 捕获细长目标的长轴/短轴依赖。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        return self.post_msca(out)
