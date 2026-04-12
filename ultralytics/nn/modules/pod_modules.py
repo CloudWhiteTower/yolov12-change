@@ -1,4 +1,4 @@
-"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial、ECALayer、GRN、A2C2fECA、A2C2fEMAECA、A2C2fEMAGRN、TripletAttention、MSCALite、A2C2fTriplet、A2C2fMSCA。"""
+"""大豆豆荚分割改进模块：EMA、CoordAttention、A2C2fEMA、A2C2fEMASpatial、ECALayer、GRN、A2C2fECA、A2C2fEMAECA、A2C2fEMAGRN、TripletAttention、MSCALite、A2C2fTriplet、A2C2fMSCA、A2C2fTripletMSCA、A2C2fMSCATriplet、A2C2fMSCATripletParallel。"""
 
 import math
 
@@ -480,3 +480,79 @@ class A2C2fMSCA(A2C2f):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = super().forward(x)
         return self.post_msca(out)
+
+
+# ── R8 融合模块：MSCA × Triplet ─────────────────────────────────────
+
+
+class A2C2fTripletMSCA(A2C2f):
+    """A2C2f → TripletAttention → MSCALite 串行融合。
+
+    Triplet 在前：三分支加权均值（无 sigmoid 截断）保留完整幅度，
+    MSCA 在后：单次 sigmoid 门控，避免双 sigmoid 级联衰减。
+    符合 CBAM (ECCV 2018) 粗到细注意力级联范式。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_triplet = TripletAttention()
+        self.post_msca = MSCALite(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        out = self.post_triplet(out)
+        return self.post_msca(out)
+
+
+class A2C2fMSCATriplet(A2C2f):
+    """A2C2f → MSCALite → TripletAttention 串行融合。
+
+    MSCA 在前提供方向性空间增强 + sigmoid 门控，
+    Triplet 在后做跨维度交互（三分支均值）。
+    存在 MSCA sigmoid 截断后 Triplet 幅度收窄风险，作为对照实验。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        out = self.post_msca(out)
+        return self.post_triplet(out)
+
+
+class A2C2fMSCATripletParallel(A2C2f):
+    """A2C2f → 并行门控 MSCA + Triplet 融合。
+
+    可学习标量 α（初始 0.5），经 sigmoid 映射后加权：
+      out = σ(α) · MSCA(feat) + (1-σ(α)) · Triplet(feat)
+    允许网络自适应发现两路最佳融合比例。参数增量仅 +1 scalar。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        w = torch.sigmoid(self.alpha)
+        return w * self.post_msca(out) + (1.0 - w) * self.post_triplet(out)

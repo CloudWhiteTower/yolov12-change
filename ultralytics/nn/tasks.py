@@ -81,6 +81,9 @@ from ultralytics.nn.modules import (
     MSCALite,
     A2C2fTriplet,
     A2C2fMSCA,
+    A2C2fTripletMSCA,
+    A2C2fMSCATriplet,
+    A2C2fMSCATripletParallel,
 )
 
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
@@ -1028,6 +1031,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             A2C2fEMAGRN,
             A2C2fTriplet,
             A2C2fMSCA,
+            A2C2fTripletMSCA,
+            A2C2fMSCATriplet,
+            A2C2fMSCATripletParallel,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1064,6 +1070,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 A2C2fEMAGRN,
                 A2C2fTriplet,
                 A2C2fMSCA,
+                A2C2fTripletMSCA,
+                A2C2fMSCATriplet,
+                A2C2fMSCATripletParallel,
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1
@@ -1071,7 +1080,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
-            if m in {A2C2f, A2C2fEMA, A2C2fSimAM, A2C2fEMASpatial, A2C2fECA, A2C2fEMAECA, A2C2fEMAGRN, A2C2fTriplet, A2C2fMSCA}: 
+            if m in {A2C2f, A2C2fEMA, A2C2fSimAM, A2C2fEMASpatial, A2C2fECA, A2C2fEMAECA, A2C2fEMAGRN, A2C2fTriplet, A2C2fMSCA, A2C2fTripletMSCA, A2C2fMSCATriplet, A2C2fMSCATripletParallel}: 
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.append(True)
