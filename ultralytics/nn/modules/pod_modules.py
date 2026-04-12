@@ -556,3 +556,241 @@ class A2C2fMSCATripletParallel(A2C2f):
         out = super().forward(x)
         w = torch.sigmoid(self.alpha)
         return w * self.post_msca(out) + (1.0 - w) * self.post_triplet(out)
+
+
+# ── R9 新模块 ────────────────────────────────────────────────────────
+
+
+class DropBlock2D(nn.Module):
+    """DropBlock: structured dropout for convolutional features (NeurIPS 2018).
+
+    在特征图上 drop 连续 block_size × block_size 区域，
+    强制网络学习冗余表征，缓解过拟合。
+
+    论文: Ghiasi et al., "DropBlock: A regularization method for
+          convolutional networks", NeurIPS 2018.
+
+    Args:
+        block_size: drop 区域边长，默认 3
+        keep_prob: 保留概率，默认 0.9（训练时生效，推理时恒等）
+    """
+
+    def __init__(self, block_size: int = 3, keep_prob: float = 0.9):
+        super().__init__()
+        self.block_size = block_size
+        self.keep_prob = keep_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.keep_prob >= 1.0:
+            return x
+        _, _, h, w = x.shape
+        # gamma: 每个位置被选为 block 中心的概率
+        valid_h = max(h - self.block_size + 1, 1)
+        valid_w = max(w - self.block_size + 1, 1)
+        gamma = (1.0 - self.keep_prob) / (self.block_size ** 2)
+        gamma *= (h * w) / (valid_h * valid_w)
+        # 采样 mask（单通道广播到全部通道）
+        mask = (torch.rand(x.shape[0], 1, h, w, device=x.device) < gamma).float()
+        # 扩展为 block 区域
+        pad = self.block_size // 2
+        mask = torch.nn.functional.max_pool2d(
+            mask, kernel_size=self.block_size, stride=1, padding=pad,
+        )
+        mask = 1.0 - mask
+        # 归一化保持期望不变
+        count = mask.numel()
+        count_ones = mask.sum()
+        if count_ones == 0:
+            return x * 0.0
+        return x * mask * (count / count_ones)
+
+
+class FcaNetLite(nn.Module):
+    """轻量 FcaNet: 多频谱通道注意力 (ICCV 2021 简化版).
+
+    将 SE-Net 的 GAP（DC 分量）推广为多频 DCT 分量池化，
+    不同通道组使用不同频率基，捕获更丰富的频域信息。
+    DCT 基固定不可学习（论文验证优于可学习版本）。
+
+    论文: Qin Z, Zhang P, Wu F, Li X.
+          "FcaNet: Frequency Channel Attention Networks", ICCV 2021.
+    代码: https://github.com/cfzd/FcaNet
+
+    Args:
+        channels: 输入通道数
+        reduction: FC 层通道压缩比，默认 16
+        num_freq: 使用的 DCT 频率数量，默认 4
+    """
+
+    def __init__(self, channels: int, reduction: int = 16, num_freq: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.num_freq = min(num_freq, channels)
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        # 多频谱池化：将通道均分为 num_freq 组，各组使用不同 DCT 基加权
+        group_size = c // self.num_freq
+        pooled_parts = []
+        for i in range(self.num_freq):
+            start = i * group_size
+            end = start + group_size if i < self.num_freq - 1 else c
+            xi = x[:, start:end, :, :]
+            if i == 0:
+                # DC 分量（等价于 GAP）
+                pi = xi.mean(dim=[2, 3])
+            else:
+                # 第 i 号频率：cos(π·i·u/H) 加权后求均值
+                freq_h = torch.cos(
+                    math.pi * i * torch.arange(h, device=x.device, dtype=x.dtype) / h
+                ).view(1, 1, h, 1)
+                freq_w = torch.cos(
+                    math.pi * i * torch.arange(w, device=x.device, dtype=x.dtype) / w
+                ).view(1, 1, 1, w)
+                pi = (xi * freq_h * freq_w).mean(dim=[2, 3])
+            pooled_parts.append(pi)
+        pooled = torch.cat(pooled_parts, dim=1)  # (B, C)
+        attn = self.fc(pooled).view(b, c, 1, 1)
+        return x * attn
+
+
+class A2C2fMSCATripletParallelDB(A2C2f):
+    """A2C2fMSCATripletParallel + DropBlock 正则化 (R9 实验).
+
+    在 parallel 融合输出后施加 DropBlock，
+    强制网络学习更鲁棒特征，缓解 best→final 衰减。
+
+    论文: Ghiasi et al. NeurIPS 2018 + R8 parallel 架构.
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.dropblock = DropBlock2D(block_size=3, keep_prob=0.9)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        w = torch.sigmoid(self.alpha)
+        fused = w * self.post_msca(out) + (1.0 - w) * self.post_triplet(out)
+        return self.dropblock(fused)
+
+
+class A2C2fFcaNet(A2C2f):
+    """A2C2f + FcaNetLite 频域通道注意力 (R9 实验).
+
+    在 R-ELAN 输出后施加多频谱通道注意力，
+    与 MSCA（空间方向性）、Triplet（跨维度旋转）完全正交。
+
+    论文: Qin et al., "FcaNet: Frequency Channel Attention Networks",
+          ICCV 2021.
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_fca = FcaNetLite(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        return self.post_fca(out)
+
+
+class A2C2fParallelFcaNet(A2C2f):
+    """A2C2fMSCATripletParallel → FcaNetLite 串行 (R9 实验).
+
+    先用 parallel 融合 MSCA+Triplet，再用 FcaNet 做频域通道重校准。
+    空间注意力(parallel) + 频域通道注意力(FcaNet) 互补。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.post_fca = FcaNetLite(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        w = torch.sigmoid(self.alpha)
+        fused = w * self.post_msca(out) + (1.0 - w) * self.post_triplet(out)
+        return self.post_fca(fused)
+
+
+class A2C2fParallelDBFcaNet(A2C2f):
+    """A2C2fMSCATripletParallel + DropBlock + FcaNetLite (R9 实验).
+
+    三合一组合：parallel 融合 → DropBlock 正则化 → FcaNet 频域通道校准。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.dropblock = DropBlock2D(block_size=3, keep_prob=0.9)
+        self.post_fca = FcaNetLite(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        w = torch.sigmoid(self.alpha)
+        fused = w * self.post_msca(out) + (1.0 - w) * self.post_triplet(out)
+        fused = self.dropblock(fused)
+        return self.post_fca(fused)
+
+
+class A2C2fTriwayParallel(A2C2f):
+    """MSCA + Triplet + FcaNet 三路 softmax 并行融合 (R9 实验).
+
+    三个正交维度注意力并行：
+      - MSCA: 空间方向性（条形卷积匹配细长目标）
+      - Triplet: 跨维度旋转（C×H, C×W, H×W）
+      - FcaNet: 频域通道（多频谱通道注意力）
+    通过 softmax 归一化的三标量门控 [α, β, γ] 自适应融合。
+
+    Args:
+        继承 A2C2f 全部参数，无额外参数。
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, a2: bool = True, area: int = 1,
+                 residual: bool = False, mlp_ratio: float = 2.0, e: float = 0.5,
+                 g: int = 1, shortcut: bool = True):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        self.post_msca = MSCALite(c2)
+        self.post_triplet = TripletAttention()
+        self.post_fca = FcaNetLite(c2)
+        self.gate = nn.Parameter(torch.zeros(3))  # [α, β, γ]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward(x)
+        w = torch.softmax(self.gate, dim=0)
+        return (w[0] * self.post_msca(out)
+                + w[1] * self.post_triplet(out)
+                + w[2] * self.post_fca(out))
